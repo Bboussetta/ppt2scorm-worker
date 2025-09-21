@@ -15,16 +15,51 @@ import { nanoid } from "nanoid";
 const exec = promisify(_exec);
 const app = express();
 
-const WORKER_SECRET = process.env.WORKER_SECRET || ""; // set in Railway/Cloud Run
+// --- Normalize env + helpers ---
+function norm(s) {
+  return String(s ?? "").trim();
+}
+const WORKER_SECRET = norm(process.env.WORKER_SECRET);
 
+function mask(s) {
+  if (!s) return "(empty)";
+  return `${s.slice(0, 2)}…${s.slice(-2)} (${s.length})`;
+}
+
+// Health + diag
 app.get("/health", (_req, res) => res.status(200).send("ok"));
+app.get("/diag", (_req, res) => {
+  res.json({
+    hasSecret: Boolean(WORKER_SECRET),
+    secretMasked: mask(WORKER_SECRET),
+  });
+});
 
 app.post("/convert", async (req, res) => {
   try {
-    if (!WORKER_SECRET || req.headers["x-worker-secret"] !== WORKER_SECRET) {
+    // ---- SECRET CHECK (instrumented) ----
+    const receivedRaw =
+      req.headers["x-worker-secret"] ??
+      req.headers["X-Worker-Secret"] ??
+      req.get("x-worker-secret") ??
+      "";
+    const received = norm(receivedRaw);
+    const expected = WORKER_SECRET;
+
+    console.log("SECDBG", {
+      recv_len: received.length,
+      exp_len: expected.length,
+      recv_head: received.slice(0, 3),
+      recv_tail: received.slice(-3),
+      exp_head: expected.slice(0, 3),
+      exp_tail: expected.slice(-3),
+    });
+
+    if (expected && received !== expected) {
       return res.status(401).send("Unauthorized");
     }
 
+    // --- defaults + temp dir ---
     let title = "Converted Presentation";
     let tmpDir = `/tmp/${nanoid()}`;
     let uploadPath = "";
@@ -55,11 +90,10 @@ app.post("/convert", async (req, res) => {
     if (!uploadPath) return res.status(400).send("No file uploaded");
 
     // --- 1) PPT/PPTX -> PDF
-    // LibreOffice writes PDF to --outdir
     await exec(`soffice --headless --convert-to pdf --outdir "${tmpDir}" "${uploadPath}"`);
     const pdfPath = `${tmpDir}/${baseName}.pdf`;
 
-    // --- 2) PDF -> PNG slides (slide-1.png, slide-2.png, ...)
+    // --- 2) PDF -> PNG slides
     const slidesDir = `${tmpDir}/slides`;
     await fse.ensureDir(slidesDir);
     await exec(`pdftoppm -png "${pdfPath}" "${slidesDir}/slide"`);
@@ -90,7 +124,6 @@ app.post("/convert", async (req, res) => {
     }
     await archive.finalize();
 
-    // cleanup after stream finishes (best effort)
     archive.on("end", async () => { try { await fse.remove(tmpDir); } catch {} });
 
   } catch (err) {
@@ -189,3 +222,4 @@ function escapeXml(s){return escapeHtml(s)}
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log("Worker listening on", PORT));
+
